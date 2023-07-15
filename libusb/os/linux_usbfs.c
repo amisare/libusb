@@ -401,6 +401,10 @@ static int op_init(struct libusb_context *ctx)
 		return LIBUSB_SUCCESS;
 	}
 
+#if defined(__ANDROID__)
+	return LIBUSB_SUCCESS;
+#endif
+
 	r = LIBUSB_SUCCESS;
 	if (init_count == 0) {
 		/* start up hotplug event handler */
@@ -426,6 +430,10 @@ static void op_exit(struct libusb_context *ctx)
 	if (no_enumeration) {
 		return;
 	}
+
+#if defined(__ANDROID__)
+	return;
+#endif
 
 	assert(init_count != 0);
 	if (!--init_count) {
