@@ -2080,149 +2080,156 @@ static int submit_bulk_transfer(struct usbi_transfer *itransfer)
 
 static int submit_iso_transfer(struct usbi_transfer *itransfer)
 {
-	struct libusb_transfer *transfer =
-		USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
-	struct linux_transfer_priv *tpriv = usbi_get_transfer_priv(itransfer);
-	struct linux_device_handle_priv *hpriv =
-		usbi_get_device_handle_priv(transfer->dev_handle);
-	struct usbfs_urb **urbs;
-	int num_packets = transfer->num_iso_packets;
-	int num_packets_remaining;
-	int i, j;
-	int num_urbs;
-	unsigned int packet_len;
-	unsigned int total_len = 0;
-	unsigned char *urb_buffer = transfer->buffer;
+    struct libusb_transfer *transfer =
+            USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+    struct linux_transfer_priv *tpriv = usbi_get_transfer_priv(itransfer);
+    struct linux_device_handle_priv *hpriv =
+            usbi_get_device_handle_priv(transfer->dev_handle);
+    struct usbfs_urb **urbs;
+    size_t alloc_size;
+    int num_packets = transfer->num_iso_packets;
+    int i;
+    int this_urb_len = 0;
+    int num_urbs = 1;
+    int packet_offset = 0;
+    unsigned int packet_len;
+    unsigned char *urb_buffer = transfer->buffer;
 
-	if (num_packets < 1)
-		return LIBUSB_ERROR_INVALID_PARAM;
+    if (tpriv->iso_urbs)
+        return LIBUSB_ERROR_BUSY;
 
-	/* usbfs places arbitrary limits on iso URBs. this limit has changed
-	 * at least three times, but we attempt to detect this limit during
-	 * init and check it here. if the kernel rejects the request due to
-	 * its size, we return an error indicating such to the user.
-	 */
-	for (i = 0; i < num_packets; i++) {
-		packet_len = transfer->iso_packet_desc[i].length;
+    /* usbfs places a 32kb limit on iso URBs. we divide up larger requests
+     * into smaller units to meet such restriction, then fire off all the
+     * units at once. it would be simpler if we just fired one unit at a time,
+     * but there is a big performance gain through doing it this way.
+     *
+     * Newer kernels lift the 32k limit (USBFS_CAP_NO_PACKET_SIZE_LIM),
+     * using arbritary large transfers is still be a bad idea though, as
+     * the kernel needs to allocate physical contiguous memory for this,
+     * which may fail for large buffers.
+     */
 
-		if (packet_len > max_iso_packet_len) {
-			usbi_warn(TRANSFER_CTX(transfer),
-				  "iso packet length of %u bytes exceeds maximum of %u bytes",
-				  packet_len, max_iso_packet_len);
-			return LIBUSB_ERROR_INVALID_PARAM;
-		}
+    /* calculate how many URBs we need */
+    for (i = 0; i < num_packets; i++) {
+        unsigned int space_remaining = MAX_ISO_BUFFER_LENGTH - this_urb_len;
+        packet_len = transfer->iso_packet_desc[i].length;
 
-		total_len += packet_len;
-	}
+        if (packet_len > space_remaining) {
+            num_urbs++;
+            this_urb_len = packet_len;
+        } else {
+            this_urb_len += packet_len;
+        }
+    }
+    usbi_dbg(TRANSFER_CTX(transfer), "need %d 32k URBs for transfer", num_urbs);
 
-	if (transfer->length < (int)total_len)
-		return LIBUSB_ERROR_INVALID_PARAM;
+    alloc_size = num_urbs * sizeof(*urbs);
+    urbs = calloc(1, alloc_size);
+    if (!urbs)
+        return LIBUSB_ERROR_NO_MEM;
 
-	/* usbfs limits the number of iso packets per URB */
-	num_urbs = (num_packets + (MAX_ISO_PACKETS_PER_URB - 1)) / MAX_ISO_PACKETS_PER_URB;
+    tpriv->iso_urbs = urbs;
+    tpriv->num_urbs = num_urbs;
+    tpriv->num_retired = 0;
+    tpriv->reap_action = NORMAL;
+    tpriv->iso_packet_offset = 0;
 
-	usbi_dbg(TRANSFER_CTX(transfer), "need %d urbs for new transfer with length %d", num_urbs, transfer->length);
+    /* allocate + initialize each URB with the correct number of packets */
+    for (i = 0; i < num_urbs; i++) {
+        struct usbfs_urb *urb;
+        unsigned int space_remaining_in_urb = MAX_ISO_BUFFER_LENGTH;
+        int urb_packet_offset = 0;
+        unsigned char *urb_buffer_orig = urb_buffer;
+        int j;
+        int k;
 
-	urbs = calloc(num_urbs, sizeof(*urbs));
-	if (!urbs)
-		return LIBUSB_ERROR_NO_MEM;
+        /* swallow up all the packets we can fit into this URB */
+        while (packet_offset < transfer->num_iso_packets) {
+            packet_len = transfer->iso_packet_desc[packet_offset].length;
+            if (packet_len <= space_remaining_in_urb) {
+                /* throw it in */
+                urb_packet_offset++;
+                packet_offset++;
+                space_remaining_in_urb -= packet_len;
+                urb_buffer += packet_len;
+            } else {
+                /* it can't fit, save it for the next URB */
+                break;
+            }
+        }
 
-	tpriv->iso_urbs = urbs;
-	tpriv->num_urbs = num_urbs;
-	tpriv->num_retired = 0;
-	tpriv->reap_action = NORMAL;
-	tpriv->iso_packet_offset = 0;
+        alloc_size = sizeof(*urb)
+                     + (urb_packet_offset * sizeof(struct usbfs_iso_packet_desc));
+        urb = calloc(1, alloc_size);
+        if (!urb) {
+            free_iso_urbs(tpriv);
+            return LIBUSB_ERROR_NO_MEM;
+        }
+        urbs[i] = urb;
 
-	/* allocate + initialize each URB with the correct number of packets */
-	num_packets_remaining = num_packets;
-	for (i = 0, j = 0; i < num_urbs; i++) {
-		int num_packets_in_urb = MIN(num_packets_remaining, MAX_ISO_PACKETS_PER_URB);
-		struct usbfs_urb *urb;
-		size_t alloc_size;
-		int k;
+        /* populate packet lengths */
+        for (j = 0, k = packet_offset - urb_packet_offset;
+             k < packet_offset; k++, j++) {
+            packet_len = transfer->iso_packet_desc[k].length;
+            urb->iso_frame_desc[j].length = packet_len;
+        }
 
-		alloc_size = sizeof(*urb)
-			+ (num_packets_in_urb * sizeof(struct usbfs_iso_packet_desc));
-		urb = calloc(1, alloc_size);
-		if (!urb) {
-			free_iso_urbs(tpriv);
-			return LIBUSB_ERROR_NO_MEM;
-		}
-		urbs[i] = urb;
+        urb->usercontext = itransfer;
+        urb->type = USBFS_URB_TYPE_ISO;
+        /* FIXME: interface for non-ASAP data? */
+        urb->flags = USBFS_URB_ISO_ASAP;
+        urb->endpoint = transfer->endpoint;
+        urb->number_of_packets = urb_packet_offset;
+        urb->buffer = urb_buffer_orig;
+    }
 
-		/* populate packet lengths */
-		for (k = 0; k < num_packets_in_urb; j++, k++) {
-			packet_len = transfer->iso_packet_desc[j].length;
-			urb->buffer_length += packet_len;
-			urb->iso_frame_desc[k].length = packet_len;
-		}
+    /* submit URBs */
+    for (i = 0; i < num_urbs; i++) {
+        int r = ioctl(hpriv->fd, IOCTL_USBFS_SUBMITURB, urbs[i]);
+        if (r < 0) {
+            if (errno == ENODEV) {
+                r = LIBUSB_ERROR_NO_DEVICE;
+            } else {
+                usbi_err(TRANSFER_CTX(transfer),
+                         "submiturb failed error %d errno=%d", r, errno);
+                r = LIBUSB_ERROR_IO;
+            }
 
-		urb->usercontext = itransfer;
-		urb->type = USBFS_URB_TYPE_ISO;
-		/* FIXME: interface for non-ASAP data? */
-		urb->flags = USBFS_URB_ISO_ASAP;
-		urb->endpoint = transfer->endpoint;
-		urb->number_of_packets = num_packets_in_urb;
-		urb->buffer = urb_buffer;
+            /* if the first URB submission fails, we can simply free up and
+             * return failure immediately. */
+            if (i == 0) {
+                usbi_dbg(TRANSFER_CTX(transfer), "first URB failed, easy peasy");
+                free_iso_urbs(tpriv);
+                return r;
+            }
 
-		urb_buffer += urb->buffer_length;
-		num_packets_remaining -= num_packets_in_urb;
-	}
+            /* if it's not the first URB that failed, the situation is a bit
+             * tricky. we must discard all previous URBs. there are
+             * complications:
+             *  - discarding is asynchronous - discarded urbs will be reaped
+             *    later. the user must not have freed the transfer when the
+             *    discarded URBs are reaped, otherwise libusb will be using
+             *    freed memory.
+             *  - the earlier URBs may have completed successfully and we do
+             *    not want to throw away any data.
+             * so, in this case we discard all the previous URBs BUT we report
+             * that the transfer was submitted successfully. then later when
+             * the final discard completes we can report error to the user.
+             */
+            tpriv->reap_action = SUBMIT_FAILED;
 
-	/* submit URBs */
-	for (i = 0; i < num_urbs; i++) {
-		int r = ioctl(hpriv->fd, IOCTL_USBFS_SUBMITURB, urbs[i]);
+            /* The URBs we haven't submitted yet we count as already
+             * retired. */
+            tpriv->num_retired = num_urbs - i;
+            discard_urbs(itransfer, 0, i);
 
-		if (r == 0)
-			continue;
+            usbi_dbg(TRANSFER_CTX(transfer), "reporting successful submission but waiting for %d "
+                     "discards before reporting error", i);
+            return 0;
+        }
+    }
 
-		if (errno == ENODEV) {
-			r = LIBUSB_ERROR_NO_DEVICE;
-		} else if (errno == EINVAL) {
-			usbi_warn(TRANSFER_CTX(transfer), "submiturb failed, transfer too large");
-			r = LIBUSB_ERROR_INVALID_PARAM;
-		} else if (errno == EMSGSIZE) {
-			usbi_warn(TRANSFER_CTX(transfer), "submiturb failed, iso packet length too large");
-			r = LIBUSB_ERROR_INVALID_PARAM;
-		} else {
-			usbi_err(TRANSFER_CTX(transfer), "submiturb failed, errno=%d", errno);
-			r = LIBUSB_ERROR_IO;
-		}
-
-		/* if the first URB submission fails, we can simply free up and
-		 * return failure immediately. */
-		if (i == 0) {
-			usbi_dbg(TRANSFER_CTX(transfer), "first URB failed, easy peasy");
-			free_iso_urbs(tpriv);
-			return r;
-		}
-
-		/* if it's not the first URB that failed, the situation is a bit
-		 * tricky. we must discard all previous URBs. there are
-		 * complications:
-		 *  - discarding is asynchronous - discarded urbs will be reaped
-		 *    later. the user must not have freed the transfer when the
-		 *    discarded URBs are reaped, otherwise libusb will be using
-		 *    freed memory.
-		 *  - the earlier URBs may have completed successfully and we do
-		 *    not want to throw away any data.
-		 * so, in this case we discard all the previous URBs BUT we report
-		 * that the transfer was submitted successfully. then later when
-		 * the final discard completes we can report error to the user.
-		 */
-		tpriv->reap_action = SUBMIT_FAILED;
-
-		/* The URBs we haven't submitted yet we count as already
-		 * retired. */
-		tpriv->num_retired = num_urbs - i;
-		discard_urbs(itransfer, 0, i);
-
-		usbi_dbg(TRANSFER_CTX(transfer), "reporting successful submission but waiting for %d "
-			 "discards before reporting error", i);
-		return 0;
-	}
-
-	return 0;
+    return 0;
 }
 
 static int submit_control_transfer(struct usbi_transfer *itransfer)
