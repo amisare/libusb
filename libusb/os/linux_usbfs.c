@@ -401,10 +401,6 @@ static int op_init(struct libusb_context *ctx)
 		return LIBUSB_SUCCESS;
 	}
 
-#if defined(__ANDROID__)
-	return LIBUSB_SUCCESS;
-#endif
-
 	r = LIBUSB_SUCCESS;
 	if (init_count == 0) {
 		/* start up hotplug event handler */
@@ -431,10 +427,6 @@ static void op_exit(struct libusb_context *ctx)
 		return;
 	}
 
-#if defined(__ANDROID__)
-	return;
-#endif
-
 	assert(init_count != 0);
 	if (!--init_count) {
 		/* tear down event handler */
@@ -458,13 +450,13 @@ static int op_set_option(struct libusb_context *ctx, enum libusb_option option, 
 
 static int linux_scan_devices(struct libusb_context *ctx)
 {
-	int ret;
+	int ret = LIBUSB_SUCCESS;
 
 	usbi_mutex_static_lock(&linux_hotplug_lock);
 
 #if defined(HAVE_LIBUDEV)
 	ret = linux_udev_scan_devices(ctx);
-#else
+#elif !defined(__ANDROID__)
 	ret = linux_default_scan_devices(ctx);
 #endif
 
