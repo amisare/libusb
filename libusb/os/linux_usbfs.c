@@ -378,6 +378,7 @@ static int op_init(struct libusb_context *ctx)
 			max_iso_packet_len = 98304;
 		else if (kernel_version_ge(&kversion, 3, 10, 0))
 			// fix: [submit_iso_transfer] submiturb failed, errno=12
+			// max_iso_packet_len = 49152;
 			max_iso_packet_len = 32768;
 		else
 			max_iso_packet_len = 8192;
