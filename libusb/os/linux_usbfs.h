@@ -70,8 +70,8 @@ struct usbfs_iso_packet_desc {
 	unsigned int status;
 };
 
-#define MAX_BULK_BUFFER_LENGTH		16384
-#define MAX_CTRL_BUFFER_LENGTH		4096
+#define MAX_BULK_BUFFER_LENGTH		16384	// 16 x 1024 = 16KB
+#define MAX_CTRL_BUFFER_LENGTH		4096	// 4 x 1024 = 4KB
 
 #define MAX_ISO_PACKETS_PER_URB		128
 
